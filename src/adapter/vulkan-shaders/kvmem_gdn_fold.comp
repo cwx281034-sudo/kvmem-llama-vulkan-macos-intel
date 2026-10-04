@@ -1,0 +1,137 @@
+#version 450
+// Gated delta net replay fold: recurrent state, then conv history.
+//
+// Ports __global__ gdn_fold_f32 and gdn_conv_fold_f32 from
+// llama.cpp/ggml/src/ggml-cuda/gated_delta_net.cu to Vulkan. The arithmetic is
+// unchanged; only the CUDA warp intrinsics are replaced.
+//
+// The CUDA version lays one column of the 128x128 state matrix on 32 lanes and
+// reduces the dot product with warp_reduce_sum. A Vulkan sub-group has no
+// guaranteed width, so the reduction here is a shared-memory tree over the 32
+// lanes of a column group, which gives the same sum for any workgroup size and
+// needs no subgroup extension.
+//
+// Layout, from the CUDA kernel (FP32 Qwen GDN: 128-wide heads, 16 key heads,
+// 48 value heads, conv width 4):
+//   state[(head*128 + col)*128 + row]
+//   key[(t*16 + head%16)*128 + row]
+//   value[(t*48 + head)*128 + col]
+//   gate[t*48 + head]        log decay, exp applied here
+//   beta[t*48 + head]
+//   conv[channel*3 + i]      conv history, n_channels channels
+//   conv_input[(source-3)*n_channels + channel]
+//
+// Everything lives in one buffer: the recurrent state and conv history are
+// written in place, and key/value/gate/beta/conv_input are read-only regions of
+// the same allocation, which is what the CUDA version receives as well. The host
+// passes byte offsets, so no buffer device address arithmetic is needed here.
+
+#include "kvmem_common.comp"
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n_keep;      // records to fold
+    uint is_conv;     // 0: state fold, 1: conv history fold
+    uint n_channels;  // conv channel count (10240)
+    uint layer;       // index of the layer descriptor to fold
+
+    // Byte offsets of the layer's fields, read from the descriptor array the
+    // host uploaded.
+    uint off_state;
+    uint off_conv;
+    uint off_key;
+    uint off_value;
+    uint off_gate;
+    uint off_beta;
+    uint off_conv_input;
+} pc;
+
+// binding 0: read-only regions (key, value, gate, beta, conv_input)
+// binding 1: read-write region (state, conv)
+layout(std430, binding = 0) readonly buffer Rdbuf { uint words[]; } Rd;
+layout(std430, binding = 1) buffer Rwbuf { uint words[]; } Rw;
+
+float ldr(uint off, uint idx) { return uintBitsToFloat(Rd.words[(off >> 2u) + idx]); }
+float ldw(uint off, uint idx) { return uintBitsToFloat(Rw.words[(off >> 2u) + idx]); }
+void  stw(uint off, uint idx, float v) { Rw.words[(off >> 2u) + idx] = floatBitsToUint(v); }
+
+shared float red[32];
+
+void main() {
+    // ---- conv history ------------------------------------------------------
+    if (pc.is_conv != 0u) {
+        const uint channel = gl_GlobalInvocationID.x;
+        if (channel >= pc.n_channels) {
+            return;
+        }
+        float history[3];
+        for (uint i = 0u; i < 3u; ++i) {
+            const uint source = pc.n_keep + i;
+            history[i] = source < 3u
+                ? ldw(pc.off_conv, channel * 3u + source)
+                : ldr(pc.off_conv_input, (source - 3u) * pc.n_channels + channel);
+        }
+        for (uint i = 0u; i < 3u; ++i) {
+            stw(pc.off_conv, channel * 3u + i, history[i]);
+        }
+        return;
+    }
+
+    // ---- recurrent state ---------------------------------------------------
+    // gl_WorkGroupID.x = value head (48), .y = layer, .z = column group (32);
+    // local_size_x = lane within the head (32), local_size_y = column in group (8).
+    const uint head = gl_WorkGroupID.x;
+    const uint lid  = gl_LocalInvocationID.x;
+    const uint col  = gl_WorkGroupID.z * 8u + gl_LocalInvocationID.y;
+    if (col >= 128u) {
+        return;
+    }
+
+    // 128 rows / 32 lanes = 4 rows per lane, matching the CUDA rows constant.
+    float s[4];
+    for (uint r = 0u; r < 4u; ++r) {
+        s[r] = ldw(pc.off_state, (head * 128u + col) * 128u + r * 32u + lid);
+    }
+
+    for (uint t = 0u; t < pc.n_keep; ++t) {
+        const uint key_base = (t * 16u + head % 16u) * 128u;
+        float k[4];
+        for (uint r = 0u; r < 4u; ++r) {
+            k[r] = ldr(pc.off_key, key_base + r * 32u + lid);
+        }
+        const float decay = exp(ldr(pc.off_gate, t * 48u + head));
+        const float value = ldr(pc.off_value, (t * 48u + head) * 128u + col);
+        const float beta  = ldr(pc.off_beta,  t * 48u + head);
+
+        // gdn_delta_f32: dot(state, key) over the head, reduced across lanes.
+        float partial = 0.0;
+        for (uint r = 0u; r < 4u; ++r) {
+            partial += s[r] * k[r];
+        }
+        // One reduction per column group: 8u columns share the
+        // workgroup, so the tree reduces within a group of 8u
+        // threads rather than across all 32 lanes.
+        red[gl_LocalInvocationID.y * 32u + lid] = partial;
+        barrier();
+        for (uint stride = 8u / 2u; stride > 0u; stride >>= 1u) {
+            if (lid < stride) {
+                const uint base = gl_LocalInvocationID.y * 32u;
+                red[base + lid] += red[base + lid + stride];
+            }
+            barrier();
+        }
+        const float dot = red[gl_LocalInvocationID.y * 32u];
+        barrier();
+
+        // gdn_update_f32: state = decay * state + key * delta
+        const float delta = (value - decay * dot) * beta;
+        for (uint r = 0u; r < 4u; ++r) {
+            s[r] = decay * s[r] + k[r] * delta;
+        }
+    }
+
+    for (uint r = 0u; r < 4u; ++r) {
+        stw(pc.off_state, (head * 128u + col) * 128u + r * 32u + lid, s[r]);
+    }
+}

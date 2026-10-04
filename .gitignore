@@ -1,0 +1,8 @@
+build-*/
+models/
+.agent-teams/
+.DS_Store
+*.swp
+artifacts/*/
+!artifacts/kvmem-llama-vulkan-macos-standalone.tar.gz
+!artifacts/kvmem-llama-vulkan-macos-standalone.tar.gz.sha256

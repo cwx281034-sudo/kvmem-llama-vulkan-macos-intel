@@ -1,0 +1,131 @@
+// Shared declarations for the KVMem stage-in compute shaders.
+//
+// Each kernel reads one packed slab and writes one scratch region, both bound
+// as single storage buffers. The block layout on the host side is declared in
+// src/adapter/llama-kvmem-stagein-vulkan.h; keep the two in step.
+//
+// Scale factors (fp16 block_q8_0::d, block_q4_0::d) are read with a bit
+// expansion instead of a load, because std430 does not give a fp16 scalar a
+// known 2 byte alignment. Expanding the 16 bits by hand keeps every access a
+// 4 byte load and avoids depending on scalar block layout.
+
+#ifndef KVMEM_VK_COMMON
+#define KVMEM_VK_COMMON
+
+// layout(local_size_*) is declared per shader, not here: the CUDA kernels used
+// 64 (rope), 128 (fwht) and 256 (dequant/quant/gather) threads per block, and
+// the sizes are compiled into the SPIR-V.
+
+// Block element counts, matching ggml's QK8_0 and QK4_0.
+const uvec2 QK8_0 = uvec2(32u, 2u);
+const uvec2 QK4_0 = uvec2(32u, 1u);
+
+// Byte-granular access into a uint-viewed storage buffer.
+//
+// The quantized block layouts are 34 and 18 bytes, neither a multiple of 4, so
+// consecutive blocks share a word and a block's scale can start mid-word. Reading
+// with buf[off] would pick up the neighbouring block's bytes whenever the block
+// offset is not word aligned, which is the case for every block but the first.
+// GLSL has no way to pass an unsized SSBO array to a function, so the caller
+// supplies the word: these helpers mask the bytes out of the containing word.
+
+uint kvmem_byte_in_word(uint w, uint abs_byte_off) {
+    return (w >> (8u * (abs_byte_off & 3u))) & 0xffu;
+}
+
+// int8_t extension. GLSL has no signed byte type, and casting the uint that
+// kvmem_byte_in_word returns to int does not sign extend: 0xc1 would become 193
+// instead of -63. Shift the byte into the top of a word and back down instead.
+int kvmem_i8_in_word(uint w, uint abs_byte_off) {
+    return int((w << (24u - 8u * (abs_byte_off & 3u)))) >> 24u;
+}
+
+// The two bytes can straddle a word boundary, and either way the containing word
+// also holds the neighbouring block's bytes, so a 16 bit field has to be masked
+// out of the two words it touches rather than read as one whole word. GLSL has
+// no way to pass an unsized SSBO array to a function, so the caller passes the
+// two words. When the field is word aligned this is the same value as
+// buf[off >> 2] & 0xffff, and when it straddles, the second word contributes
+// only its lowest byte.
+// The field's first byte is byte `byte_pos` of w0. When byte_pos < 3 the second
+// byte is byte `byte_pos` of w1, and the field is entirely inside w0, so w1 is
+// ignored. When byte_pos == 3 the second byte is byte 0 of w1.
+uint kvmem_u16(uint w0, uint w1, uint byte_pos) {
+    const uint lo = (w0 >> (8u * byte_pos)) & 0xffu;
+    if (byte_pos < 3u) {
+        // both bytes live in w0: w0 holds bytes 0..3, so the pair is contiguous
+        return ((w0 >> (8u * byte_pos)) & 0xffffu);
+    }
+    return lo | (((w1 & 0xffu) << 8u));
+}
+
+// The quantized layout helpers below need ggml's QK values, which are declared
+// by the including shader before it calls them. GLSL cannot pass a storage
+// buffer's unsized array to a function, so these take the element they work on
+// rather than the buffer.
+
+// One q8_0 element as a byte: round(x * id) truncated to int8_t, which is the
+// CUDA cast semantics.
+uint kvmem_q8_byte(float x, float id) {
+    return uint(int(round(x * id))) & 0xffu;
+}
+
+// One q4_0 byte from the element pair (x, y): x goes in the low nibble, y in the
+// high. Callers pass element j and element j + 16 of the same block.
+uint kvmem_q4_byte(float x, float y, float id) {
+    const int xi0 = min(int(x * id + 8.5), 15);
+    const int xi1 = min(int(y * id + 8.5), 15);
+    return uint((xi0 & 15) | ((xi1 & 15) << 4));
+}
+
+uint kvmem_half_to_bits(uint packed) {
+    const uint sign = (packed >> 15) & 1u;
+    const uint exp  = (packed >> 10) & 0x1fu;
+    const uint mant = packed & 0x3ffu;
+
+    if (exp == 0u) {
+        if (mant == 0u) {
+            return sign << 31;
+        }
+        // Subnormal half, normalize it into an fp32 normal.
+        uint e = 0u;
+        uint m = mant;
+        while ((m & 0x400u) == 0u) {
+            m <<= 1;
+            e += 1;
+        }
+        m &= 0x3ffu;
+        return (sign << 31) | ((127u - 15u - e + 1u) << 23) | (m << 13);
+    }
+    if (exp == 0x1fu) {
+        return (sign << 31) | (0xffu << 23) | (mant << 13);
+    }
+    return (sign << 31) | ((exp + 127u - 15u) << 23) | (mant << 13);
+}
+
+float kvmem_half_to_float(uint packed) {
+    return uintBitsToFloat(kvmem_half_to_bits(packed));
+}
+
+// Round to nearest fp32 and store the high 16 bits. Matches the CUDA
+// __float2half the adapter used for block_q8_0::d and block_q4_0::d.
+uint kvmem_float_to_half(float f) {
+    const uint bits = floatBitsToUint(f);
+    const uint sign = (bits >> 31) & 1u;
+    const int  exp  = int((bits >> 23) & 0xffu) - 127;
+    const uint mant = bits & 0x7fffffu;
+
+    if (((bits >> 23) & 0xffu) == 0xffu) {
+        return (sign << 15) | 0x7c00u | (mant != 0u ? 0x200u : 0u);
+    }
+    if (exp > 15) {
+        return (sign << 15) | 0x7c00u;
+    }
+    if (exp < -14) {
+        return sign << 15;
+    }
+    const uint h_mant = (mant + 0xfffu + ((mant >> 13) & 1u)) >> 13;
+    return (sign << 15) | (uint(exp + 15) << 10) | (h_mant & 0x3ffu);
+}
+
+#endif  // KVMEM_VK_COMMON

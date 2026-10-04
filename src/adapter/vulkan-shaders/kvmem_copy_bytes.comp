@@ -1,0 +1,89 @@
+#version 450
+// Batched device-to-device gather/scatter.
+//
+// Mirrors __global__ copy_bytes from llama-kvmem-stagein.cu: one work group per
+// op, threads inside the group stride over the op's byte range.
+//
+// A Vulkan buffer has no host pointer a shader can dereference, so the ops
+// carry buffer device addresses. They are 64 bit, while an SSBO subscript must
+// be a 32 bit integer, so the host passes the device address base and the
+// per-op values are offsets from it. Both fit in 32 bits on every device ggml
+// supports: the Vulkan 1.1 bufferDeviceAddress on a discrete GPU is 0 based and
+// on a UMA device it is the start of the shared allocation.
+//
+// The byte view is indexed in 4 byte words, which also keeps every access
+// naturally aligned: the host guarantees each op's byte range starts and ends
+// on a 4 byte boundary.
+
+#include "kvmem_common.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n_ops;   // number of ops to run
+    uint pad0;
+    uint pad1;
+    uint pad2;
+} pc;
+
+// src and dst are byte offsets from the device address base.
+struct copy_op_t {
+    uint src;     // byte offset of the source
+    uint dst;     // byte offset of the destination
+    uint nbytes;
+    uint pad;
+};
+
+layout(std430, binding = 0) readonly buffer Ops { copy_op_t ops[]; };
+
+// One word view of the whole device memory allocation.
+layout(std430, binding = 1) buffer Memview { uint words[]; };
+
+void main() {
+    const uint i = gl_WorkGroupID.x;
+    if (i >= pc.n_ops) {
+        return;
+    }
+
+    const uint s = ops[i].src;
+    const uint d = ops[i].dst;
+    const uint nbytes = ops[i].nbytes;
+    if (nbytes == 0u) {
+        return;
+    }
+
+    const uint lid = gl_LocalInvocationID.x;
+
+    // Both ends 16 byte aligned and a multiple of 16 bytes: move whole words.
+    if (((s | d | nbytes) & 15u) == 0u) {
+        const uint sw = s >> 2u;
+        const uint dw = d >> 2u;
+        const uint n4 = nbytes >> 4;
+        for (uint j = lid; j < n4; j += 256u) {
+            const uint o = j << 2u;
+            const uint v0 = words[sw + o + 0u];
+            const uint v1 = words[sw + o + 1u];
+            const uint v2 = words[sw + o + 2u];
+            const uint v3 = words[sw + o + 3u];
+            words[dw + o + 0u] = v0;
+            words[dw + o + 1u] = v1;
+            words[dw + o + 2u] = v2;
+            words[dw + o + 3u] = v3;
+        }
+        return;
+    }
+
+    // Uneven case: copy word at a time, then the tail byte at a time. The host
+    // guarantees the range starts 4 byte aligned, so only the last word can be
+    // partial.
+    const uint sw = s >> 2u;
+    const uint dw = d >> 2u;
+    const uint nfull = nbytes >> 2u;
+    for (uint j = lid; j < nfull; j += 256u) {
+        words[dw + j] = words[sw + j];
+    }
+    for (uint j = (nfull << 2u) + lid; j < nbytes; j += 256u) {
+        const uint b = (words[sw + nfull] >> (8u * ((j & 3u)))) & 0xffu;
+        words[dw + j >> 2u] = (words[dw + j >> 2u] & ~(0xffu << (8u * (j & 3u)))) | (b << (8u * (j & 3u)));
+    }
+}

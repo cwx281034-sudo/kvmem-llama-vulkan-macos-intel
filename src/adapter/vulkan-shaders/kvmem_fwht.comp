@@ -1,0 +1,70 @@
+#version 450
+// Walsh-Hadamard transform over an f32 scratch region.
+//
+// Mirrors template __global__ fwht_kernel<N> from llama-kvmem-stagein.cu: scale
+// the row, then for h = 1, 2, 4 ... N/2 do the butterfly on every (base, i) pair
+// with base a multiple of 2h and i < h.
+//
+// The CUDA kernel gave one thread a whole row and held it in registers, so a row
+// of up to 512 floats needed no scratch and no cross-thread communication. That
+// does not map onto a Vulkan workgroup, where a row spans many invocations and
+// each butterfly stage needs a barrier.
+//
+// So this kernel instead gives each invocation one element of one row and runs
+// the whole butterfly schedule, keeping its own element in a register and
+// reading its partner from the row. Concretely, element j is written only by the
+// invocation that owns j, and it reads partner j XOR h. That makes every stage a
+// plain load/store with no shared memory, and the result is bit-identical to the
+// CUDA kernel's: the butterfly is symmetric, so whichever invocation owns j
+// computes exactly a+b or a-b for it.
+//
+// Because a partner read at stage h must see the value written by the previous
+// stage, every stage ends in a barrier.
+
+#include "kvmem_common.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n_rows;   // rows to transform
+    uint nrot;     // transform width, a power of two, >= 32
+    float scale;   // 1 / sqrt(nrot), computed on the host
+    uint pad1;
+} pc;
+
+layout(std430, binding = 0) buffer X { float x[]; };
+
+void main() {
+    // One workgroup per row; the group's 256 invocations walk the row's elements,
+    // so a row of up to 512 elements needs two iterations.
+    const uint row = gl_WorkGroupID.x;
+    if (row >= pc.n_rows) {
+        return;
+    }
+
+    const uint rbase = row * pc.nrot;
+    const uint tid   = gl_LocalInvocationID.x;
+
+    // scale this element on load
+    for (uint e = tid; e < pc.nrot; e += 256u) {
+        x[rbase + e] *= pc.scale;
+    }
+    barrier();
+
+    // Stage h pairs element e with e + h for every e that is a multiple of 2h.
+    // Both halves are written by the same invocation, so a stage is a plain
+    // read-modify-write of disjoint pairs and needs no shared memory.
+    for (uint h = 1u; h < pc.nrot; h *= 2u) {
+        for (uint base = 0u; base < pc.nrot; base += 2u * h) {
+            for (uint e = base + tid; e < base + h; e += 256u) {
+                const float a = x[rbase + e];
+                const float b = x[rbase + e + h];
+                x[rbase + e]     = a + b;
+                x[rbase + e + h] = a - b;
+            }
+        }
+        // Both halves of every pair are written above before the next stage
+        // reads a new partner.
+        barrier();
+    }
+}

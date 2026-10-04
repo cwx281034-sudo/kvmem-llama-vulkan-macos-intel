@@ -1,0 +1,45 @@
+#version 450
+// NeoX RoPE over an f32 scratch region.
+//
+// Mirrors __global__ rope_neox_kernel from llama-kvmem-stagein.cu: one thread
+// per (token, head) pair, each thread rotating its own n_rot/2 pairs. There is
+// no reduction, so one invocation per pair matches the CUDA thread mapping.
+
+#include "kvmem_common.comp"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n_tokens;     // number of tokens in the scratch region
+    uint n_head;       // number of heads
+    uint n_embd_head;  // embedding size of one head
+    uint n_rot;        // rotary width, always even
+    int  pos0;         // position of token 0
+    uint pad0;
+    uint pad1;
+    uint pad2;
+} pc;
+
+layout(std430, binding = 0) buffer X     { float x[]; };
+layout(std430, binding = 1) readonly  buffer Theta { float theta[]; };
+
+void main() {
+    const uint t = gl_GlobalInvocationID.x;
+    const uint h = gl_GlobalInvocationID.y;
+    if (t >= pc.n_tokens || h >= pc.n_head) {
+        return;
+    }
+
+    const uint base = (t * pc.n_head + h) * pc.n_embd_head;
+    const uint nhalf = pc.n_rot / 2u;
+    const float pos = float(int(pc.pos0) + int(t));
+
+    for (uint i = 0u; i < nhalf; ++i) {
+        const float s = sin(pos * theta[i]);
+        const float c = cos(pos * theta[i]);
+        const float x0 = x[base + i];
+        const float x1 = x[base + i + nhalf];
+        x[base + i]        = x0 * c - x1 * s;
+        x[base + i + nhalf] = x0 * s + x1 * c;
+    }
+}

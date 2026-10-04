@@ -1,0 +1,46 @@
+#version 450
+// Decode mean-K running sum.
+//
+// Mirrors __global__ meank_add_f32 / meank_add_f16 / meank_add_bf16 from
+// llama-kvmem-stagein.cu: one thread per embedding element, looping over the
+// kept tokens and accumulating into acc[d]. There is no cross-thread reduction,
+// so the thread mapping is unchanged from the CUDA version.
+//
+// The host stages the K rows it needs into this engine's own f32 scratch before
+// dispatching (see kvmem_meank_add), because a ggml tensor buffer has no
+// VkBuffer this facade could bind. Two consequences:
+//
+//   * This kernel only ever reads f32. The f16 and bf16 decode happens on the
+//     host while staging, so there is no element-type switch here.
+//   * The staged rows are a dense [n_keep][n_embd] array with the heads already
+//     laid out end to end, so no head or stride arithmetic is needed either.
+//
+// binding 0 is this layer's slice of the accumulator, which the host offsets
+// when it binds, so the kernel indexes acc[d] from 0 like the CUDA kernel did.
+
+#include "kvmem_common.comp"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n_embd;    // elements in one layer's accumulator
+    uint n_keep;    // number of staged rows to fold in
+    uint pad0;
+    uint pad1;
+} pc;
+
+layout(std430, binding = 0) buffer Acc { float acc[]; };
+layout(std430, binding = 1) readonly buffer Rows { float rows[]; };
+
+void main() {
+    const uint d = gl_GlobalInvocationID.x;
+    if (d >= pc.n_embd) {
+        return;
+    }
+
+    float s = acc[d];
+    for (uint t = 0u; t < pc.n_keep; ++t) {
+        s += rows[t * pc.n_embd + d];
+    }
+    acc[d] = s;
+}

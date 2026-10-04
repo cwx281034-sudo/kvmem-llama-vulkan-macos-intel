@@ -1,0 +1,60 @@
+#version 450
+// q8_0 / q4_0 dequantization, one invocation per quantized block.
+//
+// Mirrors __global__ dequant_q8_0 / dequant_q4_0 from llama-kvmem-stagein.cu:
+//   dst_f32[block * QK + j] = float(qs[j]) * float(d)
+
+#include "kvmem_common.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n_blocks;   // number of quantized blocks to convert
+    uint is_q4;      // 0: q8_0, 1: q4_0
+    uint src_byte;   // byte offset of this item's first block in the source slab
+    uint pad1;
+} pc;
+
+layout(std430, binding = 0) readonly  buffer Src { uint src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { float dst[]; };
+
+// Block sizes in bytes.
+const uint Q8_BLOCK = 34u;
+const uint Q4_BLOCK = 18u;
+
+// The 2 byte scale sits at the front of the block and may straddle a word.
+float scale_at(uint base) {
+    const uint p = base & 3u;
+    return kvmem_half_to_float(kvmem_u16(src[base >> 2u], src[(base >> 2u) + 1u], p));
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_blocks) {
+        return;
+    }
+
+    // Several items are packed into the same slab in kvmem_stagein_flush, so each
+    // starts at its own byte offset. The host passes it here.
+    if (pc.is_q4 == 0u) {
+        // block_q8_0 { half d; int8_t qs[32] }
+        const uint base = pc.src_byte + i * Q8_BLOCK;
+        const float d = scale_at(base);
+        for (uint j = 0u; j < QK8_0.x; ++j) {
+            const uint off = base + 2u + j;
+            const int q = kvmem_i8_in_word(src[off >> 2u], off);
+            dst[i * QK8_0.x + j] = float(q) * d;
+        }
+    } else {
+        // block_q4_0 { half d; uint8_t qs[16] }; qs[j] holds element j in the low
+        // nibble and element j + 16 in the high nibble.
+        const uint base = pc.src_byte + i * Q4_BLOCK;
+        const float d = scale_at(base);
+        for (uint j = 0u; j < QK4_0.x / 2u; ++j) {
+            const uint off = base + 2u + j;
+            const uint b = kvmem_byte_in_word(src[off >> 2u], off);
+            dst[i * QK4_0.x + j]                = float(int(b & 0x0fu) - 8) * d;
+            dst[i * QK4_0.x + j + QK4_0.x / 2u] = float(int((b >> 4u) & 0x0fu) - 8) * d;
+        }
+    }
+}

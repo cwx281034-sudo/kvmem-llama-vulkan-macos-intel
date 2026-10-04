@@ -1,0 +1,102 @@
+#version 450
+// q8_0 / q4_0 quantization, one invocation per block.
+//
+// Mirrors __global__ quant_q8_0 / quant_q4_0 from llama-kvmem-stagein.cu.
+// The CUDA kernels were already one thread per block rather than a thread per
+// element, so no work sharing across invocations is needed and the reduction
+// over the 32 values of a block stays inside one invocation.
+
+#include "kvmem_common.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n_blocks;  // number of blocks to quantize
+    uint is_q4;     // 0: q8_0, 1: q4_0
+    uint pad0;
+    uint pad1;
+} pc;
+
+layout(std430, binding = 0) readonly buffer Src { float src[]; };
+layout(std430, binding = 1) buffer Dst { uint dst[]; };
+
+// Block strides in the destination, in BYTES.
+//
+// ggml packs q8_0 at 34 bytes and q4_0 at 18, and neither is a multiple of 4, so
+// in the packed layout consecutive blocks share a word. Two invocations filling
+// their own halves of a shared word would race: they are separate invocations
+// with no barrier between them, and any read-modify-write loses one update.
+//
+// So this kernel writes a word-aligned layout instead: 36 bytes per q8_0 block
+// (34 + 2 pad) and 20 per q4_0 block (18 + 2 pad). Every word then belongs to
+// exactly one block and is written with a plain store. The host unpacks into
+// ggml's packed layout on the way out.
+const uint Q8_STRIDE = 36u;   // 9 words
+const uint Q4_STRIDE = 20u;   // 5 words
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_blocks) {
+        return;
+    }
+
+    // both quant types have 32 elements per block
+    const uint ebase = i * QK8_0.x;
+
+    float amax = 0.0;
+    float vmax = 0.0;
+    for (uint j = 0u; j < QK8_0.x; ++j) {
+        const float v = src[ebase + j];
+        // q8_0 only needs the magnitude; q4_0 also keeps the signed value that
+        // produced it, exactly like the CUDA kernels.
+        if (amax < abs(v)) {
+            amax = abs(v);
+            vmax = v;
+        }
+    }
+
+    if (pc.is_q4 == 0u) {
+        const float d  = amax / 127.0;
+        const float id = d != 0.0 ? 1.0 / d : 0.0;
+        const uint half_d = kvmem_float_to_half(d);
+        const uint w = i * (Q8_STRIDE / 4u);
+
+        // word 0: scale (2 bytes) then qs[0..1]
+        dst[w] = (half_d & 0xffffu)
+               | (kvmem_q8_byte(src[ebase + 0u], id) << 16u)
+               | (kvmem_q8_byte(src[ebase + 1u], id) << 24u);
+        // words 1..7: qs[2..29]
+        for (uint k = 1u; k < 8u; ++k) {
+            const uint j = 2u + (k - 1u) * 4u;
+            dst[w + k] = kvmem_q8_byte(src[ebase + j + 0u], id)
+                       | (kvmem_q8_byte(src[ebase + j + 1u], id) << 8u)
+                       | (kvmem_q8_byte(src[ebase + j + 2u], id) << 16u)
+                       | (kvmem_q8_byte(src[ebase + j + 3u], id) << 24u);
+        }
+        // word 8: qs[30..31], the 2 padding bytes stay zero
+        dst[w + 8u] = kvmem_q8_byte(src[ebase + 30u], id)
+                    | (kvmem_q8_byte(src[ebase + 31u], id) << 8u);
+    } else {
+        const float d  = vmax / -8.0;
+        const float id = d != 0.0 ? 1.0 / d : 0.0;
+        const uint half_d = kvmem_float_to_half(d);
+        const uint w = i * (Q4_STRIDE / 4u);
+        const uint nh = QK8_0.x / 2u;   // q4_0 pairs element j with j + 16
+
+        // word 0: scale (2 bytes) then qs[0..1]
+        dst[w] = (half_d & 0xffffu)
+               | (kvmem_q4_byte(src[ebase + 0u], src[ebase + 0u + nh], id) << 16u)
+               | (kvmem_q4_byte(src[ebase + 1u], src[ebase + 1u + nh], id) << 24u);
+        // words 1..3: qs[2..13]
+        for (uint k = 1u; k < 4u; ++k) {
+            const uint j = 2u + (k - 1u) * 4u;
+            dst[w + k] = kvmem_q4_byte(src[ebase + j + 0u], src[ebase + j + 0u + nh], id)
+                       | (kvmem_q4_byte(src[ebase + j + 1u], src[ebase + j + 1u + nh], id) << 8u)
+                       | (kvmem_q4_byte(src[ebase + j + 2u], src[ebase + j + 2u + nh], id) << 16u)
+                       | (kvmem_q4_byte(src[ebase + j + 3u], src[ebase + j + 3u + nh], id) << 24u);
+        }
+        // word 4: qs[14..15], the 2 padding bytes stay zero
+        dst[w + 4u] = kvmem_q4_byte(src[ebase + 14u], src[ebase + 14u + nh], id)
+                    | (kvmem_q4_byte(src[ebase + 15u], src[ebase + 15u + nh], id) << 8u);
+    }
+}
